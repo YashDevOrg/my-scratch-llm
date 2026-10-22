@@ -252,12 +252,31 @@ class MiniLlama(nn.Module):
         top_p: Optional[float] = None,
         repetition_penalty: float = 1.0,
         do_sample: bool = True,
+        banned_token_ids: Optional[list] = None,
     ) -> torch.Tensor:
-        """Autoregressively generate tokens given an input prompt tensor."""
+        """Autoregressively generate tokens.
+
+        Args:
+            banned_token_ids: Hard-ban list — token IDs forced to -inf at every
+                step, making them physically impossible to generate.
+        """
+        # Pre-build banned token tensor once for efficiency
+        banned_tensor: Optional[torch.Tensor] = None
+        if banned_token_ids:
+            banned_tensor = torch.tensor(
+                [t for t in banned_token_ids if 0 <= t < self.cfg.vocab_size],
+                dtype=torch.long,
+                device=idx.device,
+            )
+
         for _ in range(max_new_tokens):
             idx_cond = idx if idx.size(1) <= self.cfg.max_seq_len else idx[:, -self.cfg.max_seq_len:]
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :]
+
+            # Hard ban: force banned token logits to -inf before any other processing
+            if banned_tensor is not None and len(banned_tensor) > 0:
+                logits[:, banned_tensor] = -float("inf")
 
             # Apply repetition penalty to already generated/seen tokens
             if repetition_penalty != 1.0:

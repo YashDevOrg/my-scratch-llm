@@ -305,6 +305,19 @@ def test_chat_single(
     return reply
 
 
+def _build_banned_token_ids(tokenizer: Any, canned_phrases: List[str]) -> List[int]:
+    """Collect every sub-token ID from each canned phrase.
+
+    Banning all sub-tokens (not just first tokens) prevents the model from
+    generating ANY part of these sequences regardless of context position.
+    """
+    banned: set = set()
+    for phrase in canned_phrases:
+        ids = tokenizer.encode(phrase, add_special_tokens=False)
+        banned.update(ids)
+    return list(banned)
+
+
 def chat_interactive(args: argparse.Namespace) -> None:
     """Interactive command-line chat session."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -330,21 +343,33 @@ def chat_interactive(args: argparse.Namespace) -> None:
 
     model.eval()
 
-    # Pre-compute token IDs for canned phrases we want to permanently ban
+    # Warn if model is severely overfit (loss ~0 means it memorized one answer)
+    # This is a training problem; hard token banning will suppress the phrase but
+    # the model will still be incoherent until re-trained with fewer steps/lower LR.
+    if os.path.exists(ckpt):
+        _ckpt_loss = torch.load(ckpt, map_location="cpu", weights_only=False).get("loss", 1.0)
+        if _ckpt_loss < 0.01:
+            print(
+                f"\n[WARNING] Checkpoint loss={_ckpt_loss:.4f}. The SFT model is severely overfit.\n"
+                "  Re-running SFT with fewer steps is recommended:\n"
+                "  python sft_chat.py --redo_sft --checkpoint_path <pretrain_ckpt>\n"
+                "  Hard token banning will suppress the canned phrase for now.\n"
+            )
+
+    # Build comprehensive hard-ban list at the full token level.
+    # These IDs are set to -inf inside model.generate() before every sampling step,
+    # making it physically impossible to generate these tokens.
     CANNED_PHRASES = [
-        "Hello! How can I help you today?",
         "How can I help you today?",
         "Hello! How can I help",
         "How can I assist you",
         "How can I help",
+        "! How can I",
+        "How can I",
+        "I can help",
     ]
-    # Collect first-token IDs of all canned phrases and ban them from position 0 of generation
-    ban_first_token_ids: List[int] = []
-    for phrase in CANNED_PHRASES:
-        tids = tokenizer.encode(phrase, add_special_tokens=False)
-        if tids:
-            ban_first_token_ids.append(tids[0])
-    ban_first_token_ids = list(set(ban_first_token_ids))
+    banned_ids = _build_banned_token_ids(tokenizer, CANNED_PHRASES)
+    print(f"Hard-banned {len(banned_ids)} token IDs to suppress canned phrases.")
 
     print("\n" + "=" * 60)
     print("      MiniLlama-50M Interactive Chat Mode")
@@ -365,75 +390,33 @@ def chat_interactive(args: argparse.Namespace) -> None:
             print("Goodbye!")
             break
 
-        # Format input using chat template — do NOT pre-fill any assistant text
+        # Clean chat template — no pre-filled assistant text
         prompt_text = f"<|user|>\n{user_input}<|assistant|>\n"
         tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
         prompt_tensor = torch.tensor([tokens], dtype=torch.long, device=device)
 
-        reply = ""
-        max_attempts = 3
-
-        for attempt in range(1, max_attempts + 1):
-            # Escalate temperature on retries to break out of a rut
-            attempt_temp = min(args.temperature + (attempt - 1) * 0.2, 2.0)
-
-            with torch.no_grad():
-                out = model.generate(
-                    prompt_tensor,
-                    max_new_tokens=args.max_new_tokens,
-                    temperature=attempt_temp,
-                    top_k=args.top_k,
-                    top_p=args.top_p,
-                    repetition_penalty=args.repetition_penalty,
-                    do_sample=args.do_sample,
-                )
-
-            gen_tokens = out[0, len(tokens):].tolist()
-            candidate = tokenizer.decode(gen_tokens)
-
-            # Stop at conversation boundaries
-            for stop_tok in ["<|eos|>", "<|user|>", "<|assistant|>", "<|pad|>"]:
-                if stop_tok in candidate:
-                    candidate = candidate.split(stop_tok)[0]
-            candidate = candidate.strip()
-
-            # Check if output is a banned canned phrase
-            is_canned = any(
-                phrase.lower() in candidate.lower() for phrase in CANNED_PHRASES
+        with torch.no_grad():
+            out = model.generate(
+                prompt_tensor,
+                max_new_tokens=args.max_new_tokens,
+                temperature=args.temperature,
+                top_k=args.top_k,
+                top_p=args.top_p,
+                repetition_penalty=args.repetition_penalty,
+                do_sample=args.do_sample,
+                banned_token_ids=banned_ids,
             )
 
-            if is_canned and attempt < max_attempts:
-                print(f"  [retry {attempt}/{max_attempts-1}...]", end="\r", flush=True)
-                continue
+        gen_tokens = out[0, len(tokens):].tolist()
+        reply = tokenizer.decode(gen_tokens)
 
-            reply = candidate
-            break
+        for stop_tok in ["<|eos|>", "<|user|>", "<|assistant|>", "<|pad|>"]:
+            if stop_tok in reply:
+                reply = reply.split(stop_tok)[0]
 
-        # Final fallback: if still a canned greeting, prefix the user's words
-        # to force the model to continue coherently
-        if not reply or any(phrase.lower() in reply.lower() for phrase in CANNED_PHRASES):
-            # Give model a topic seed derived from user input and re-try once more
-            first_word = user_input.split()[0] if user_input.split() else "Sure"
-            seeded_prompt = f"<|user|>\n{user_input}<|assistant|>\n{first_word},"
-            seeded_tokens = tokenizer.encode(seeded_prompt, add_special_tokens=False)
-            seeded_tensor = torch.tensor([seeded_tokens], dtype=torch.long, device=device)
-            with torch.no_grad():
-                out = model.generate(
-                    seeded_tensor,
-                    max_new_tokens=args.max_new_tokens,
-                    temperature=min(args.temperature + 0.4, 2.0),
-                    top_k=args.top_k,
-                    top_p=args.top_p,
-                    repetition_penalty=max(args.repetition_penalty, 1.4),
-                    do_sample=True,
-                )
-            gen_tokens = out[0, len(seeded_tokens):].tolist()
-            seeded_reply = tokenizer.decode(gen_tokens)
-            for stop_tok in ["<|eos|>", "<|user|>", "<|assistant|>", "<|pad|>"]:
-                if stop_tok in seeded_reply:
-                    seeded_reply = seeded_reply.split(stop_tok)[0]
-            # Reassemble with the seeded first word
-            reply = f"{first_word}, {seeded_reply.strip()}"
+        reply = reply.strip()
+        if not reply:
+            reply = "[No output — model may be overfit. Run: python sft_chat.py --redo_sft --checkpoint_path <pretrain_ckpt>]"
 
         print(f"\nMiniLlama: {reply}")
 
@@ -447,14 +430,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--tokenizer_dir", type=str, default="tokenizer", help="Directory of saved tokenizer")
     parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
     parser.add_argument("--seq_len", type=int, default=256, help="Sequence length")
-    parser.add_argument("--max_steps", type=int, default=300, help="SFT training steps (200-500)")
-    parser.add_argument("--lr", type=float, default=2e-5, help="Learning rate for SFT (1e-5 to 2e-4)")
+    # 200 steps prevents overfit (smoltalk everyday-conversations has ~3500 samples)
+    parser.add_argument("--max_steps", type=int, default=200, help="SFT steps (100-250 to avoid overfit)")
+    # Lower LR to nudge pre-trained weights rather than overwrite them
+    parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate for SFT (2e-5 to 1e-4)")
     parser.add_argument("--warmup_steps", type=int, default=20, help="Warmup steps")
     parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
-    parser.add_argument("--save_every", type=int, default=100, help="Save SFT checkpoint every N steps")
+    parser.add_argument("--save_every", type=int, default=50, help="Save SFT checkpoint every N steps")
     parser.add_argument("--synthetic", action="store_true", help="Train on synthetic instruction pairs")
     parser.add_argument("--smoke_test", action="store_true", help="Run 5 fast SFT steps to verify training and generation")
     parser.add_argument("--chat", action="store_true", help="Launch interactive terminal chat session")
+    parser.add_argument("--redo_sft", action="store_true", help="Re-run SFT from --checkpoint_path (use after overfit)")
     parser.add_argument("--temperature", type=float, default=1.2, help="Sampling temperature (default 1.2 for diversity)")
     parser.add_argument("--repetition_penalty", type=float, default=1.3, help="Repetition penalty (default 1.3)")
     parser.add_argument(
@@ -480,5 +466,8 @@ if __name__ == "__main__":
         train_sft(args)
     elif args.chat:
         chat_interactive(args)
+    elif args.redo_sft:
+        print("Re-running SFT from base checkpoint (ignoring existing sft_checkpoint.pt)...")
+        train_sft(args)
     else:
         train_sft(args)
