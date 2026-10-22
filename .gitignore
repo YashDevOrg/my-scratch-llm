@@ -1,0 +1,21 @@
+# Environments
+.venv/
+env/
+venv/
+
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Checkpoints and models (>100MB exceeds GitHub limits)
+checkpoints/
+*.pt
+*.bin
+*.safetensors
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
