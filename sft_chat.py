@@ -310,15 +310,21 @@ def chat_interactive(args: argparse.Namespace) -> None:
     device = "cuda" if torch.cuda.is_available() else "cpu"
     tokenizer = get_or_train_tokenizer(save_dir=args.tokenizer_dir, vocab_size=32000)
 
-    # Load model from SFT checkpoint if exists, else from checkpoint_path
-    ckpt = args.save_path if os.path.exists(args.save_path) else args.checkpoint_path
+    # Use args.checkpoint_path directly
+    ckpt = args.checkpoint_path
     print(f"Loading model checkpoint from {ckpt}...")
 
     cfg = ModelConfig(vocab_size=32000, max_seq_len=1024)
     model = MiniLlama(cfg).to(device)
 
     if os.path.exists(ckpt):
-        load_checkpoint(model, None, ckpt, device=device)
+        checkpoint = torch.load(ckpt, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint["model"])
+        if hasattr(model, "lm_head") and hasattr(model, "tok_embeddings"):
+            model.lm_head.weight = model.tok_embeddings.weight
+        step = checkpoint.get("step", 0)
+        loss = checkpoint.get("loss", 0.0)
+        print(f"Loaded checkpoint from: {ckpt} (step {step}, loss: {loss:.4f})")
     else:
         print(f"Warning: Checkpoint '{ckpt}' not found! Chatting with randomly initialized weights.")
 
