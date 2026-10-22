@@ -249,6 +249,9 @@ class MiniLlama(nn.Module):
         max_new_tokens: int,
         temperature: float = 1.0,
         top_k: Optional[int] = None,
+        top_p: Optional[float] = None,
+        repetition_penalty: float = 1.0,
+        do_sample: bool = True,
     ) -> torch.Tensor:
         """Autoregressively generate tokens given an input prompt tensor."""
         for _ in range(max_new_tokens):
@@ -256,13 +259,34 @@ class MiniLlama(nn.Module):
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :]
 
-            if temperature <= 0.0:
+            # Apply repetition penalty to already generated/seen tokens
+            if repetition_penalty != 1.0:
+                for b in range(idx.shape[0]):
+                    tokens_seen = torch.unique(idx[b])
+                    token_logits = logits[b, tokens_seen]
+                    token_logits = torch.where(
+                        token_logits > 0,
+                        token_logits / repetition_penalty,
+                        token_logits * repetition_penalty,
+                    )
+                    logits[b, tokens_seen] = token_logits
+
+            if not do_sample or temperature <= 0.0:
                 idx_next = torch.argmax(logits, dim=-1, keepdim=True)
             else:
-                logits = logits / temperature
-                if top_k is not None:
+                logits = logits / max(1e-5, temperature)
+                if top_k is not None and top_k > 0:
                     v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                     logits[logits < v[:, [-1]]] = -float("inf")
+                if top_p is not None and 0.0 < top_p < 1.0:
+                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                    cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                    sorted_indices_to_remove = cumulative_probs > top_p
+                    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                    sorted_indices_to_remove[..., 0] = 0
+                    indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+                    logits[indices_to_remove] = -float("inf")
+
                 probs = F.softmax(logits, dim=-1)
                 idx_next = torch.multinomial(probs, num_samples=1)
 

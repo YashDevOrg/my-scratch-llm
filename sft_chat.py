@@ -267,6 +267,11 @@ def test_chat_single(
     device: str,
     prompt: str,
     max_new_tokens: int = 50,
+    temperature: float = 1.2,
+    repetition_penalty: float = 1.3,
+    do_sample: bool = True,
+    top_k: Optional[int] = 50,
+    top_p: Optional[float] = 0.9,
 ) -> str:
     """Run single-turn chat completion for evaluation."""
     model.eval()
@@ -275,7 +280,15 @@ def test_chat_single(
     idx = torch.tensor([tokens], dtype=torch.long, device=device)
 
     with torch.no_grad():
-        out = model.generate(idx, max_new_tokens=max_new_tokens, temperature=0.7, top_k=50)
+        out = model.generate(
+            idx,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            do_sample=do_sample,
+        )
 
     # Decode only the generated response
     gen_tokens = out[0, len(tokens) :].tolist()
@@ -340,6 +353,9 @@ def chat_interactive(args: argparse.Namespace) -> None:
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
                 top_k=args.top_k,
+                top_p=args.top_p,
+                repetition_penalty=args.repetition_penalty,
+                do_sample=args.do_sample,
             )
 
         gen_tokens = out[0, len(tokens) :].tolist()
@@ -370,8 +386,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--synthetic", action="store_true", help="Train on synthetic instruction pairs")
     parser.add_argument("--smoke_test", action="store_true", help="Run 5 fast SFT steps to verify training and generation")
     parser.add_argument("--chat", action="store_true", help="Launch interactive terminal chat session")
-    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature for chat")
+    parser.add_argument("--temperature", type=float, default=1.2, help="Sampling temperature (default 1.2 for diversity)")
+    parser.add_argument("--repetition_penalty", type=float, default=1.3, help="Repetition penalty (default 1.3)")
+    parser.add_argument(
+        "--do_sample",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable sampling during generation (default True)",
+    )
     parser.add_argument("--top_k", type=int, default=50, help="Top-k filtering for chat")
+    parser.add_argument("--top_p", type=float, default=0.9, help="Top-p nucleus sampling (default 0.9)")
     parser.add_argument("--max_new_tokens", type=int, default=60, help="Maximum generated tokens per response")
     return parser.parse_args()
 
