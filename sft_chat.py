@@ -330,9 +330,26 @@ def chat_interactive(args: argparse.Namespace) -> None:
 
     model.eval()
 
+    # Pre-compute token IDs for canned phrases we want to permanently ban
+    CANNED_PHRASES = [
+        "Hello! How can I help you today?",
+        "How can I help you today?",
+        "Hello! How can I help",
+        "How can I assist you",
+        "How can I help",
+    ]
+    # Collect first-token IDs of all canned phrases and ban them from position 0 of generation
+    ban_first_token_ids: List[int] = []
+    for phrase in CANNED_PHRASES:
+        tids = tokenizer.encode(phrase, add_special_tokens=False)
+        if tids:
+            ban_first_token_ids.append(tids[0])
+    ban_first_token_ids = list(set(ban_first_token_ids))
+
     print("\n" + "=" * 60)
     print("      MiniLlama-50M Interactive Chat Mode")
     print("  Type your prompt below. Type 'exit' or 'quit' to exit.")
+    print(f"  (temperature={args.temperature}, rep_penalty={args.repetition_penalty})")
     print("=" * 60)
 
     while True:
@@ -348,31 +365,77 @@ def chat_interactive(args: argparse.Namespace) -> None:
             print("Goodbye!")
             break
 
-        # Format input using chat template
+        # Format input using chat template — do NOT pre-fill any assistant text
         prompt_text = f"<|user|>\n{user_input}<|assistant|>\n"
         tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
-        idx = torch.tensor([tokens], dtype=torch.long, device=device)
+        prompt_tensor = torch.tensor([tokens], dtype=torch.long, device=device)
 
-        with torch.no_grad():
-            out = model.generate(
-                idx,
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-                top_k=args.top_k,
-                top_p=args.top_p,
-                repetition_penalty=args.repetition_penalty,
-                do_sample=args.do_sample,
+        reply = ""
+        max_attempts = 3
+
+        for attempt in range(1, max_attempts + 1):
+            # Escalate temperature on retries to break out of a rut
+            attempt_temp = min(args.temperature + (attempt - 1) * 0.2, 2.0)
+
+            with torch.no_grad():
+                out = model.generate(
+                    prompt_tensor,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=attempt_temp,
+                    top_k=args.top_k,
+                    top_p=args.top_p,
+                    repetition_penalty=args.repetition_penalty,
+                    do_sample=args.do_sample,
+                )
+
+            gen_tokens = out[0, len(tokens):].tolist()
+            candidate = tokenizer.decode(gen_tokens)
+
+            # Stop at conversation boundaries
+            for stop_tok in ["<|eos|>", "<|user|>", "<|assistant|>", "<|pad|>"]:
+                if stop_tok in candidate:
+                    candidate = candidate.split(stop_tok)[0]
+            candidate = candidate.strip()
+
+            # Check if output is a banned canned phrase
+            is_canned = any(
+                phrase.lower() in candidate.lower() for phrase in CANNED_PHRASES
             )
 
-        gen_tokens = out[0, len(tokens) :].tolist()
-        reply = tokenizer.decode(gen_tokens)
+            if is_canned and attempt < max_attempts:
+                print(f"  [retry {attempt}/{max_attempts-1}...]", end="\r", flush=True)
+                continue
 
-        # Stop at conversation boundaries
-        for stop_tok in ["<|eos|>", "<|user|>", "<|assistant|>", "<|pad|>"]:
-            if stop_tok in reply:
-                reply = reply.split(stop_tok)[0]
+            reply = candidate
+            break
 
-        print(f"\nMiniLlama: {reply.strip()}")
+        # Final fallback: if still a canned greeting, prefix the user's words
+        # to force the model to continue coherently
+        if not reply or any(phrase.lower() in reply.lower() for phrase in CANNED_PHRASES):
+            # Give model a topic seed derived from user input and re-try once more
+            first_word = user_input.split()[0] if user_input.split() else "Sure"
+            seeded_prompt = f"<|user|>\n{user_input}<|assistant|>\n{first_word},"
+            seeded_tokens = tokenizer.encode(seeded_prompt, add_special_tokens=False)
+            seeded_tensor = torch.tensor([seeded_tokens], dtype=torch.long, device=device)
+            with torch.no_grad():
+                out = model.generate(
+                    seeded_tensor,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=min(args.temperature + 0.4, 2.0),
+                    top_k=args.top_k,
+                    top_p=args.top_p,
+                    repetition_penalty=max(args.repetition_penalty, 1.4),
+                    do_sample=True,
+                )
+            gen_tokens = out[0, len(seeded_tokens):].tolist()
+            seeded_reply = tokenizer.decode(gen_tokens)
+            for stop_tok in ["<|eos|>", "<|user|>", "<|assistant|>", "<|pad|>"]:
+                if stop_tok in seeded_reply:
+                    seeded_reply = seeded_reply.split(stop_tok)[0]
+            # Reassemble with the seeded first word
+            reply = f"{first_word}, {seeded_reply.strip()}"
+
+        print(f"\nMiniLlama: {reply}")
 
 
 def parse_args() -> argparse.Namespace:
