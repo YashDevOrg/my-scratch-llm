@@ -41,14 +41,17 @@ class SFTDataset(IterableDataset):
     def __init__(
         self,
         tokenizer: Any,
-        dataset_name: str = "HuggingFaceTB/smoltalk",
-        subset: Optional[str] = "everyday-conversations",
+        dataset_name: str = "tatsu-lab/alpaca",
+        subset: Optional[str] = None,
         seq_len: int = 256,
         synthetic_only: bool = False,
     ):
         super().__init__()
         self.tokenizer = tokenizer
         self.dataset_name = dataset_name
+        # Sanitize CLI string "None" to Python None
+        if subset is not None and str(subset).strip().lower() in ("none", "null", ""):
+            subset = None
         self.subset = subset
         self.seq_len = seq_len
         self.synthetic_only = synthetic_only
@@ -58,8 +61,15 @@ class SFTDataset(IterableDataset):
         prompt = ""
         response = ""
 
-        # 1. HuggingFaceTB/smoltalk or ChatML messages format
-        if "messages" in item and isinstance(item["messages"], list):
+        # 1. Alpaca format (instruction + input -> output)
+        if "instruction" in item and "output" in item:
+            inst = item.get("instruction", "").strip()
+            inp = item.get("input", "").strip()
+            prompt = f"{inst}\nContext: {inp}".strip() if inp else inst
+            response = item.get("output", "").strip()
+
+        # 2. HuggingFaceTB/smoltalk or ChatML messages format
+        elif "messages" in item and isinstance(item["messages"], list):
             for m in item["messages"]:
                 role = m.get("role", "")
                 content = m.get("content", "").strip()
@@ -67,13 +77,6 @@ class SFTDataset(IterableDataset):
                     prompt = content
                 elif role == "assistant" and not response:
                     response = content
-
-        # 2. Alpaca format (instruction + input -> output)
-        elif "instruction" in item and "output" in item:
-            inst = item.get("instruction", "").strip()
-            inp = item.get("input", "").strip()
-            prompt = f"{inst}\n{inp}".strip() if inp else inst
-            response = item.get("output", "").strip()
 
         # 3. Standard prompt/response format
         elif "prompt" in item and "response" in item:
@@ -84,6 +87,7 @@ class SFTDataset(IterableDataset):
 
     def __iter__(self) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
         if self.synthetic_only:
+            print("Using synthetic instruction pairs for SFT...")
             while True:
                 for prompt, response in SYNTHETIC_SFT_PAIRS:
                     yield from self._process_pair(prompt, response)
@@ -92,17 +96,12 @@ class SFTDataset(IterableDataset):
             if self.subset:
                 kwargs["name"] = self.subset
 
-            try:
-                stream_ds = load_dataset(self.dataset_name, **kwargs)
-                for item in stream_ds:
-                    prompt, response = self._extract_pair(item)
-                    if prompt and response:
-                        yield from self._process_pair(prompt, response)
-            except Exception as e:
-                print(f"Streaming dataset error ({e}). Falling back to synthetic instructions.")
-                while True:
-                    for prompt, response in SYNTHETIC_SFT_PAIRS:
-                        yield from self._process_pair(prompt, response)
+            print(f"Streaming live dataset '{self.dataset_name}' (subset={self.subset})...")
+            stream_ds = load_dataset(self.dataset_name, **kwargs)
+            for item in stream_ds:
+                prompt, response = self._extract_pair(item)
+                if prompt and response:
+                    yield from self._process_pair(prompt, response)
 
     def _process_pair(self, prompt: str, response: str) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
         # Format text with standard chat tags
@@ -305,19 +304,6 @@ def test_chat_single(
     return reply
 
 
-def _build_banned_token_ids(tokenizer: Any, canned_phrases: List[str]) -> List[int]:
-    """Collect every sub-token ID from each canned phrase.
-
-    Banning all sub-tokens (not just first tokens) prevents the model from
-    generating ANY part of these sequences regardless of context position.
-    """
-    banned: set = set()
-    for phrase in canned_phrases:
-        ids = tokenizer.encode(phrase, add_special_tokens=False)
-        banned.update(ids)
-    return list(banned)
-
-
 def chat_interactive(args: argparse.Namespace) -> None:
     """Interactive command-line chat session."""
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -343,38 +329,10 @@ def chat_interactive(args: argparse.Namespace) -> None:
 
     model.eval()
 
-    # Warn if model is severely overfit (loss ~0 means it memorized one answer)
-    # This is a training problem; hard token banning will suppress the phrase but
-    # the model will still be incoherent until re-trained with fewer steps/lower LR.
-    if os.path.exists(ckpt):
-        _ckpt_loss = torch.load(ckpt, map_location="cpu", weights_only=False).get("loss", 1.0)
-        if _ckpt_loss < 0.01:
-            print(
-                f"\n[WARNING] Checkpoint loss={_ckpt_loss:.4f}. The SFT model is severely overfit.\n"
-                "  Re-running SFT with fewer steps is recommended:\n"
-                "  python sft_chat.py --redo_sft --checkpoint_path <pretrain_ckpt>\n"
-                "  Hard token banning will suppress the canned phrase for now.\n"
-            )
-
-    # Build comprehensive hard-ban list at the full token level.
-    # These IDs are set to -inf inside model.generate() before every sampling step,
-    # making it physically impossible to generate these tokens.
-    CANNED_PHRASES = [
-        "How can I help you today?",
-        "Hello! How can I help",
-        "How can I assist you",
-        "How can I help",
-        "! How can I",
-        "How can I",
-        "I can help",
-    ]
-    banned_ids = _build_banned_token_ids(tokenizer, CANNED_PHRASES)
-    print(f"Hard-banned {len(banned_ids)} token IDs to suppress canned phrases.")
-
     print("\n" + "=" * 60)
     print("      MiniLlama-50M Interactive Chat Mode")
     print("  Type your prompt below. Type 'exit' or 'quit' to exit.")
-    print(f"  (temperature={args.temperature}, rep_penalty={args.repetition_penalty})")
+    print(f"  (temperature={args.temperature}, top_p={args.top_p}, rep_penalty={args.repetition_penalty})")
     print("=" * 60)
 
     while True:
@@ -390,7 +348,7 @@ def chat_interactive(args: argparse.Namespace) -> None:
             print("Goodbye!")
             break
 
-        # Clean chat template — no pre-filled assistant text
+        # Modern instruction format
         prompt_text = f"<|user|>\n{user_input}<|assistant|>\n"
         tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
         prompt_tensor = torch.tensor([tokens], dtype=torch.long, device=device)
@@ -404,45 +362,49 @@ def chat_interactive(args: argparse.Namespace) -> None:
                 top_p=args.top_p,
                 repetition_penalty=args.repetition_penalty,
                 do_sample=args.do_sample,
-                banned_token_ids=banned_ids,
             )
 
         gen_tokens = out[0, len(tokens):].tolist()
         reply = tokenizer.decode(gen_tokens)
 
+        # Stop at conversation boundaries
         for stop_tok in ["<|eos|>", "<|user|>", "<|assistant|>", "<|pad|>"]:
             if stop_tok in reply:
                 reply = reply.split(stop_tok)[0]
 
         reply = reply.strip()
         if not reply:
-            reply = "[No output — model may be overfit. Run: python sft_chat.py --redo_sft --checkpoint_path <pretrain_ckpt>]"
+            reply = "[No response generated. Please try another prompt.]"
 
         print(f"\nMiniLlama: {reply}")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Stage 5: Supervised Fine-Tuning (SFT) & Chat for MiniLlama")
-    parser.add_argument("--dataset_name", type=str, default="HuggingFaceTB/smoltalk", help="Instruction dataset")
-    parser.add_argument("--subset", type=str, default="everyday-conversations", help="Dataset subset")
-    parser.add_argument("--checkpoint_path", type=str, default="checkpoints/checkpoint_latest.pt", help="Base model checkpoint")
-    parser.add_argument("--save_path", type=str, default="checkpoints/sft_checkpoint.pt", help="Path to save SFT checkpoint")
+    parser.add_argument("--dataset_name", type=str, default="tatsu-lab/alpaca", help="Instruction dataset")
+    parser.add_argument("--subset", type=str, default=None, help="Dataset subset (leave None for Alpaca)")
+    parser.add_argument(
+        "--checkpoint_path",
+        type=str,
+        default="checkpoints/checkpoint_latest.pt",
+        help="Base pretrained model checkpoint to load",
+    )
+    parser.add_argument("--save_path", type=str, default="checkpoints/sft_final.pt", help="Path to save SFT checkpoint")
     parser.add_argument("--tokenizer_dir", type=str, default="tokenizer", help="Directory of saved tokenizer")
-    parser.add_argument("--batch_size", type=int, default=4, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for SFT")
     parser.add_argument("--seq_len", type=int, default=256, help="Sequence length")
-    # 200 steps prevents overfit (smoltalk everyday-conversations has ~3500 samples)
-    parser.add_argument("--max_steps", type=int, default=200, help="SFT steps (100-250 to avoid overfit)")
-    # Lower LR to nudge pre-trained weights rather than overwrite them
-    parser.add_argument("--lr", type=float, default=5e-5, help="Learning rate for SFT (2e-5 to 1e-4)")
-    parser.add_argument("--warmup_steps", type=int, default=20, help="Warmup steps")
+    # 400 steps on Alpaca with batch_size=8 gives 3,200 diverse Q&A examples
+    parser.add_argument("--max_steps", type=int, default=400, help="SFT training steps (300-500)")
+    parser.add_argument("--lr", type=float, default=1e-4, help="Learning rate for SFT (5e-5 to 2e-4)")
+    parser.add_argument("--warmup_steps", type=int, default=30, help="Warmup steps")
     parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
-    parser.add_argument("--save_every", type=int, default=50, help="Save SFT checkpoint every N steps")
+    parser.add_argument("--save_every", type=int, default=100, help="Save SFT checkpoint every N steps")
     parser.add_argument("--synthetic", action="store_true", help="Train on synthetic instruction pairs")
     parser.add_argument("--smoke_test", action="store_true", help="Run 5 fast SFT steps to verify training and generation")
     parser.add_argument("--chat", action="store_true", help="Launch interactive terminal chat session")
-    parser.add_argument("--redo_sft", action="store_true", help="Re-run SFT from --checkpoint_path (use after overfit)")
-    parser.add_argument("--temperature", type=float, default=1.2, help="Sampling temperature (default 1.2 for diversity)")
-    parser.add_argument("--repetition_penalty", type=float, default=1.3, help="Repetition penalty (default 1.3)")
+    parser.add_argument("--redo_sft", action="store_true", help="Re-run SFT from --checkpoint_path")
+    parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature (0.6 to 0.8 is best for chat)")
+    parser.add_argument("--repetition_penalty", type=float, default=1.15, help="Repetition penalty (1.1 to 1.2)")
     parser.add_argument(
         "--do_sample",
         action=argparse.BooleanOptionalAction,
@@ -451,7 +413,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--top_k", type=int, default=50, help="Top-k filtering for chat")
     parser.add_argument("--top_p", type=float, default=0.9, help="Top-p nucleus sampling (default 0.9)")
-    parser.add_argument("--max_new_tokens", type=int, default=60, help="Maximum generated tokens per response")
+    parser.add_argument("--max_new_tokens", type=int, default=128, help="Maximum generated tokens per response")
     return parser.parse_args()
 
 
