@@ -96,7 +96,7 @@ def train(args: argparse.Namespace) -> None:
     if torch.cuda.is_available():
         device = "cuda"
         autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.float16)
-        scaler = torch.cuda.amp.GradScaler()
+        scaler = torch.amp.GradScaler("cuda") if hasattr(torch.amp, "GradScaler") else torch.cuda.amp.GradScaler()
         print(f"Device: CUDA ({torch.cuda.get_device_name(0)}) with fp16 AMP")
     else:
         device = "cpu"
