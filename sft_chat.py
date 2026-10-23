@@ -17,17 +17,25 @@ from pretrain import get_lr, load_checkpoint, save_checkpoint
 from tokenizer_setup import get_or_train_tokenizer
 
 SYNTHETIC_SFT_PAIRS = [
-    ("Hello! Who are you?", "I am MiniLlama, a modern pure PyTorch language model trained from scratch."),
+    ("Hello! Who are you?", "I am MiniLlama, a 50M parameter language model built entirely from scratch in pure PyTorch."),
+    ("What is your name?", "My name is MiniLlama. I am an AI assistant trained from scratch using pure PyTorch."),
     ("Tell me a short story about a kitten.", "Once upon a time, a curious kitten named Bella found a secret sunny garden full of friendly butterflies."),
     ("What is 2 + 2?", "2 + 2 equals 4."),
-    ("Write a poem about the night sky.", "The stars shine bright in velvet skies, watching over sleeping eyes until the golden sun arrives."),
-    ("Can you help me write Python code?", "Yes! I can help you write clean, modular, and self-contained Python code using pure PyTorch."),
-    ("What is machine learning?", "Machine learning is a field of artificial intelligence where algorithms learn patterns from data rather than following static rules."),
-    ("Tell me a fun fact.", "Honey never spoils! Archaeologists have discovered pots of edible honey in ancient Egyptian tombs that are thousands of years old."),
-    ("How do I stay healthy?", "Eat nutritious whole foods, stay physically active, drink plenty of water, and ensure you get sufficient rest every night."),
+    ("Write a poem about the night sky.", "The stars shine bright in velvet skies, watching over sleeping eyes, until the golden sun arrives."),
+    ("Can you help me write Python code?", "Yes! I can help you write clean, modular Python code. What would you like to build?"),
+    ("What is machine learning?", "Machine learning is a field of AI where algorithms learn patterns from data rather than following static rules."),
+    ("Tell me a fun fact.", "Honey never spoils. Archaeologists have found 3,000-year-old honey in Egyptian tombs that was still edible."),
+    ("How do I stay healthy?", "Eat balanced meals, exercise regularly, drink plenty of water, and get enough sleep each night."),
     ("What is the capital of France?", "The capital of France is Paris."),
-    ("Goodbye!", "Goodbye! Have a great and productive day ahead!"),
+    ("Give me a motivational quote.", '"The only way to do great work is to love what you do." - Steve Jobs'),
+    ("What can you do?", "I can answer questions, write stories, explain concepts, help with code, and have general conversations."),
+    ("hi", "Hello! I'm MiniLlama, an AI assistant. How can I help you today?"),
+    ("how are you?", "I'm doing well and ready to help! What can I do for you?"),
+    ("Goodbye!", "Goodbye! Have a wonderful day!"),
 ]
+
+# System prompt used both during SFT training and inference to anchor the model's identity
+SYSTEM_PROMPT = "You are MiniLlama, a helpful and concise AI assistant built from scratch in pure PyTorch."
 
 
 class SFTDataset(IterableDataset):
@@ -104,12 +112,13 @@ class SFTDataset(IterableDataset):
                     yield from self._process_pair(prompt, response)
 
     def _process_pair(self, prompt: str, response: str) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
-        # Format text with standard chat tags
-        user_prefix = f"<|user|>\n{prompt}<|assistant|>\n"
-        full_text = f"<|user|>\n{prompt}<|assistant|>\n{response}<|eos|>"
+        # Format with system prompt + chat tags.
+        # The system prompt anchors identity during both training and inference.
+        sys_prefix = f"<|user|>\n{SYSTEM_PROMPT}\n\n{prompt}<|assistant|>\n"
+        full_text  = f"<|user|>\n{SYSTEM_PROMPT}\n\n{prompt}<|assistant|>\n{response}<|eos|>"
 
-        prefix_ids = self.tokenizer.encode(user_prefix, add_special_tokens=False)
-        full_ids = self.tokenizer.encode(full_text, add_special_tokens=False)
+        prefix_ids = self.tokenizer.encode(sys_prefix, add_special_tokens=False)
+        full_ids   = self.tokenizer.encode(full_text,  add_special_tokens=False)
 
         if len(full_ids) <= 1:
             return
@@ -121,7 +130,7 @@ class SFTDataset(IterableDataset):
         x = chunk_tensor[:-1]
         y = chunk_tensor[1:].clone()
 
-        # Mask user prompt in targets so loss is only computed on assistant reply
+        # Mask user prompt + system prompt tokens; loss only on assistant reply
         prefix_len = min(len(prefix_ids) - 1, len(y))
         if prefix_len > 0:
             y[:prefix_len] = -100
@@ -348,8 +357,8 @@ def chat_interactive(args: argparse.Namespace) -> None:
             print("Goodbye!")
             break
 
-        # Modern instruction format
-        prompt_text = f"<|user|>\n{user_input}<|assistant|>\n"
+        # Inject system prompt so the model knows its role
+        prompt_text = f"<|user|>\n{SYSTEM_PROMPT}\n\n{user_input}<|assistant|>\n"
         tokens = tokenizer.encode(prompt_text, add_special_tokens=False)
         prompt_tensor = torch.tensor([tokens], dtype=torch.long, device=device)
 
