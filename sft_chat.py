@@ -35,7 +35,10 @@ SYNTHETIC_SFT_PAIRS = [
 ]
 
 # System prompt used both during SFT training and inference to anchor the model's identity
-SYSTEM_PROMPT = "You are MiniLlama, a helpful and concise AI assistant built from scratch in pure PyTorch."
+SYSTEM_PROMPT = (
+    "You are MiniLlama, a helpful AI assistant that answers questions and writes Python code. "
+    "Answer directly and concisely. For code requests, provide working Python code."
+)
 
 
 class SFTDataset(IterableDataset):
@@ -69,12 +72,15 @@ class SFTDataset(IterableDataset):
         prompt = ""
         response = ""
 
-        # 1. Alpaca format (instruction + input -> output)
+        # 1. Alpaca / Code-Alpaca format (instruction + input -> output)
         if "instruction" in item and "output" in item:
             inst = item.get("instruction", "").strip()
             inp = item.get("input", "").strip()
             prompt = f"{inst}\nContext: {inp}".strip() if inp else inst
             response = item.get("output", "").strip()
+            # Skip empty or trivially short code responses
+            if len(response) < 3:
+                return prompt, response
 
         # 2. HuggingFaceTB/smoltalk or ChatML messages format
         elif "messages" in item and isinstance(item["messages"], list):
